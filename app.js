@@ -28,6 +28,14 @@ function getUpcomingHourTimestamp() {
   return Math.floor(now.getTime() / 1000);
 }
 
+function renderMessageContent(pending) {
+  const statusLines = pending.userIds.map(id => {
+    const checked = pending.confirmed.includes(id);
+    return `${checked ? '✅' : '⬜'} <@${id}>`;
+  });
+  return `${pending.text}\n\n**Check-in status:**\n${statusLines.join('\n')}`;
+}
+
 async function sendReminder(text, pingId) {
   await DiscordRequest(`channels/${process.env.CHANNEL_ID}/messages`, {
     method: 'POST',
@@ -65,9 +73,11 @@ async function runCheckIn(triggeredManually = false) {
   const text = row.text;
   const userIds = extractUserIds(text);
   const pingId = Date.now().toString();
-  await sendReminder(text, pingId);
 
-  saveState({ pending: { pingId, timestamp: targetTs, text, userIds, confirmed: [] } });
+  const pending = { pingId, timestamp: targetTs, text, userIds, confirmed: [] };
+  await sendReminder(renderMessageContent(pending), pingId);
+
+  saveState({ pending });
   console.log('[checkin] Sent message for row:', row.timestamp);
   return true;
 }
@@ -170,8 +180,23 @@ app.post('/interactions', async function (req, res) {
       }
 
       return res.send({
-        type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-        data: { content: `<@${clickingUserId}> confirmed ✅`, flags: InteractionResponseFlags.EPHEMERAL },
+        type: InteractionResponseType.UPDATE_MESSAGE,
+        data: {
+          content: renderMessageContent(state.pending),
+          components: [
+            {
+              type: MessageComponentTypes.ACTION_ROW,
+              components: [
+                {
+                  type: MessageComponentTypes.BUTTON,
+                  custom_id: `confirm_${pingId}`,
+                  label: 'Confirm',
+                  style: ButtonStyleTypes.PRIMARY,
+                },
+              ],
+            },
+          ],
+        },
       });
     }
   }
