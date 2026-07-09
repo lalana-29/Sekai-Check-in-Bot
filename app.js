@@ -81,29 +81,33 @@ cron.schedule('45 * * * *', async () => {
   }
 });
 
-// :55 — resend only if someone hasn't confirmed
+// :55 — post a summary of who hasn't confirmed, in a different channel
 cron.schedule('55 * * * *', async () => {
   try {
     const state = loadState();
     const { pending } = state;
     if (!pending) return;
 
-    const allConfirmed = pending.userIds.every(id => pending.confirmed.includes(id));
-    if (allConfirmed) {
+    const missing = pending.userIds.filter(id => !pending.confirmed.includes(id));
+
+    if (missing.length === 0) {
       saveState({ pending: null });
       return;
     }
 
-    const pingId = Date.now().toString();
-    await sendReminder(pending.text, pingId);
-    saveState({ pending: { ...pending, pingId } });
+    const mentions = missing.map(id => `<@${id}>`).join(' ');
+    const summaryText = `${missing.length} user(s) did not check in: ${mentions}\nConsider sending an emergency ping.`;
+
+    await DiscordRequest(`channels/${process.env.SUMMARY_CHANNEL_ID}/messages`, {
+      method: 'POST',
+      body: { content: summaryText },
+    });
   } catch (err) {
-    console.error('Error sending :55 reminder:', err);
+    console.error('Error posting :55 summary:', err);
   }
 });
 
 app.post('/interactions', async function (req, res) {
-  console.log('[interactions] Incoming request, type:', req.body.type);
   const { type, data } = req.body;
 
   if (type === InteractionType.PING) {
@@ -114,22 +118,27 @@ app.post('/interactions', async function (req, res) {
     const { name } = data;
 
     if (name === 'trigger-checkin') {
+      res.send({
+        type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
+        data: { flags: InteractionResponseFlags.EPHEMERAL },
+      });
+
       try {
         const found = await runCheckIn(true);
-        return res.send({
-          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: {
+        await DiscordRequest(`webhooks/${process.env.APP_ID}/${req.body.token}/messages/@original`, {
+          method: 'PATCH',
+          body: {
             content: found ? 'Check-in triggered.' : 'No matching row found for the current time slot.',
-            flags: InteractionResponseFlags.EPHEMERAL,
           },
         });
       } catch (err) {
         console.error('Error running manual check-in:', err);
-        return res.send({
-          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: { content: 'Something went wrong triggering the check-in.', flags: InteractionResponseFlags.EPHEMERAL },
+        await DiscordRequest(`webhooks/${process.env.APP_ID}/${req.body.token}/messages/@original`, {
+          method: 'PATCH',
+          body: { content: 'Something went wrong triggering the check-in.' },
         });
       }
+      return;
     }
   }
 
@@ -151,7 +160,7 @@ app.post('/interactions', async function (req, res) {
       if (!state.pending.userIds.includes(clickingUserId)) {
         return res.send({
           type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: { content: "You're not on the check in, silly!", flags: InteractionResponseFlags.EPHEMERAL },
+          data: { content: "This isn't for you.", flags: InteractionResponseFlags.EPHEMERAL },
         });
       }
 
