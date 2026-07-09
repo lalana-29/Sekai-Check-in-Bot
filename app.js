@@ -103,6 +103,7 @@ cron.schedule('55 * * * *', async () => {
 });
 
 app.post('/interactions', async function (req, res) {
+  console.log('[interactions] Incoming request, type:', req.body.type);
   const { type, data } = req.body;
 
   if (type === InteractionType.PING) {
