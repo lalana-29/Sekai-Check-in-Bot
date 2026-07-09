@@ -151,7 +151,7 @@ app.post('/interactions', async function (req, res) {
       if (!state.pending.userIds.includes(clickingUserId)) {
         return res.send({
           type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: { content: "This isn't for you.", flags: InteractionResponseFlags.EPHEMERAL },
+          data: { content: "You're not on the check in, silly!", flags: InteractionResponseFlags.EPHEMERAL },
         });
       }
 
