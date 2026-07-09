@@ -31,7 +31,7 @@ function getUpcomingHourTimestamp() {
 function renderMessageContent(pending) {
   const statusLines = pending.userIds.map(id => {
     const checked = pending.confirmed.includes(id);
-    return `${checked ? '✅' : '⬜'} <@${id}>`;
+    return `${checked ? '✅' : '❌'} <@${id}>`;
   });
   return `${pending.text}\n\n**Check-in status:**\n${statusLines.join('\n')}`;
 }
