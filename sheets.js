@@ -8,12 +8,12 @@ const auth = new google.auth.JWT({
 
 const sheets = google.sheets({ version: 'v4', auth });
 
-export async function getAllRows(sheetName) {
+export async function getAllRows(sheetName, spreadsheetId) {
   const res = await sheets.spreadsheets.values.batchGet({
-    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    spreadsheetId,
     ranges: [
-      `${sheetName}!X2:X`, // timestamps
-      `${sheetName}!P2:P`, // message text
+      `${sheetName}!X2:X`,
+      `${sheetName}!P2:P`,
     ],
   });
 

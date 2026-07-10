@@ -11,6 +11,7 @@ import {
 import { VerifyDiscordRequest, DiscordRequest } from './utils.js';
 import { getAllRows } from './sheets.js';
 import { loadState, saveState } from './state.js';
+import { getGuildConfig, setGuildConfig, loadConfig } from './config.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -31,13 +32,13 @@ function getUpcomingHourTimestamp() {
 function renderMessageContent(pending) {
   const statusLines = pending.userIds.map(id => {
     const checked = pending.confirmed.includes(id);
-    return `${checked ? '✅' : '❌'} <@${id}>`;
+    return `${checked ? '✅' : '⬜'} <@${id}>`;
   });
   return `${pending.text}\n\n**Check-in status:**\n${statusLines.join('\n')}`;
 }
 
-async function sendReminder(text, pingId) {
-  await DiscordRequest(`channels/${process.env.CHANNEL_ID}/messages`, {
+async function sendReminder(text, pingId, channelId) {
+  await DiscordRequest(`channels/${channelId}/messages`, {
     method: 'POST',
     body: {
       content: text,
@@ -58,16 +59,21 @@ async function sendReminder(text, pingId) {
   });
 }
 
-async function runCheckIn(triggeredManually = false) {
-  console.log(`[checkin] Running${triggeredManually ? ' (manual trigger)' : ''} at`, new Date().toISOString());
-  const rows = await getAllRows('G1');
+async function runCheckInForGuild(guildId, triggeredManually = false) {
+  const cfg = getGuildConfig(guildId);
+  if (!cfg.channelId || !cfg.sheetId) {
+    console.log(`[checkin] Guild ${guildId} missing config, skipping.`);
+    return { sent: false, reason: 'not_configured' };
+  }
+
+  console.log(`[checkin] Running${triggeredManually ? ' (manual trigger)' : ''} for guild ${guildId} at`, new Date().toISOString());
+  const rows = await getAllRows('G1', cfg.sheetId);
   const targetTs = getUpcomingHourTimestamp();
-  console.log('[checkin] Target timestamp:', targetTs);
   const row = rows.find(r => parseInt(r.timestamp, 10) === targetTs);
 
   if (!row || !row.text) {
     console.log('[checkin] No matching row found, skipping.');
-    return false;
+    return { sent: false, reason: 'no_row' };
   }
 
   const text = row.text;
@@ -75,57 +81,98 @@ async function runCheckIn(triggeredManually = false) {
   const pingId = Date.now().toString();
 
   const pending = { pingId, timestamp: targetTs, text, userIds, confirmed: [] };
-  await sendReminder(renderMessageContent(pending), pingId);
+  await sendReminder(renderMessageContent(pending), pingId, cfg.channelId);
 
-  saveState({ pending });
+  const state = loadState();
+  state[guildId] = { pending };
+  saveState(state);
+
   console.log('[checkin] Sent message for row:', row.timestamp);
-  return true;
+  return { sent: true };
 }
 
-// :45 — find and send the row matching the upcoming :00
+// :45 — run for every configured guild
 cron.schedule('45 * * * *', async () => {
-  try {
-    await runCheckIn();
-  } catch (err) {
-    console.error('Error sending :45 message:', err);
+  const config = loadConfig();
+  for (const guildId of Object.keys(config)) {
+    try {
+      await runCheckInForGuild(guildId);
+    } catch (err) {
+      console.error(`Error sending :45 message for guild ${guildId}:`, err);
+    }
   }
 });
 
-// :55 — post a summary of who hasn't confirmed, in a different channel
+// :55 — per guild, post summary if needed, always clear pending after
 cron.schedule('55 * * * *', async () => {
-  try {
-    const state = loadState();
-    const { pending } = state;
-    if (!pending) return;
+  const config = loadConfig();
+  for (const guildId of Object.keys(config)) {
+    try {
+      const cfg = config[guildId];
+      if (!cfg.summaryChannelId) continue;
 
-    const missing = pending.userIds.filter(id => !pending.confirmed.includes(id));
+      const state = loadState();
+      const guildState = state[guildId];
+      const pending = guildState?.pending;
+      if (!pending) continue;
 
-    if (missing.length === 0) {
-      saveState({ pending: null });
-      return;
+      const missing = pending.userIds.filter(id => !pending.confirmed.includes(id));
+
+      if (missing.length > 0) {
+        const mentions = missing.map(id => `<@${id}>`).join(' ');
+        const summaryText = `${missing.length} user(s) did not check in: ${mentions}\nConsider sending an emergency ping.`;
+        await DiscordRequest(`channels/${cfg.summaryChannelId}/messages`, {
+          method: 'POST',
+          body: { content: summaryText },
+        });
+      }
+
+      // Always clear pending after :55 runs, regardless of outcome —
+      // prevents stale pending from leaking into the next hour if :45 finds no row.
+      state[guildId] = { pending: null };
+      saveState(state);
+    } catch (err) {
+      console.error(`Error posting :55 summary for guild ${guildId}:`, err);
     }
-
-    const mentions = missing.map(id => `<@${id}>`).join(' ');
-    const summaryText = `${missing.length} user(s) did not check in: ${mentions}\nConsider sending an emergency ping.`;
-
-    await DiscordRequest(`channels/${process.env.SUMMARY_CHANNEL_ID}/messages`, {
-      method: 'POST',
-      body: { content: summaryText },
-    });
-  } catch (err) {
-    console.error('Error posting :55 summary:', err);
   }
 });
 
 app.post('/interactions', async function (req, res) {
-  const { type, data } = req.body;
+  const { type, data, guild_id } = req.body;
 
   if (type === InteractionType.PING) {
     return res.send({ type: InteractionResponseType.PONG });
   }
 
   if (type === InteractionType.APPLICATION_COMMAND) {
-    const { name } = data;
+    const { name, options } = data;
+
+    if (name === 'set-checkin-channel') {
+      const channelId = options[0].value;
+      setGuildConfig(guild_id, { channelId });
+      return res.send({
+        type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+        data: { content: `Check-in channel set to <#${channelId}>.`, flags: InteractionResponseFlags.EPHEMERAL },
+      });
+    }
+
+    if (name === 'set-summary-channel') {
+      const summaryChannelId = options[0].value;
+      setGuildConfig(guild_id, { summaryChannelId });
+      return res.send({
+        type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+        data: { content: `Summary channel set to <#${summaryChannelId}>.`, flags: InteractionResponseFlags.EPHEMERAL },
+      });
+    }
+
+    if (name === 'set-sheet') {
+      const sheetId = options[0].value;
+      setGuildConfig(guild_id, { sheetId });
+      return res.send({
+        type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+        data: { content: `Sheet ID updated.`, flags: InteractionResponseFlags.EPHEMERAL },
+      });
+    }
 
     if (name === 'trigger-checkin') {
       res.send({
@@ -134,12 +181,16 @@ app.post('/interactions', async function (req, res) {
       });
 
       try {
-        const found = await runCheckIn(true);
+        const result = await runCheckInForGuild(guild_id, true);
+        let content = 'Check-in triggered.';
+        if (!result.sent) {
+          content = result.reason === 'not_configured'
+            ? 'This server isn\'t configured yet. Use /set-checkin-channel and /set-sheet first.'
+            : 'No matching row found for the current time slot.';
+        }
         await DiscordRequest(`webhooks/${process.env.APP_ID}/${req.body.token}/messages/@original`, {
           method: 'PATCH',
-          body: {
-            content: found ? 'Check-in triggered.' : 'No matching row found for the current time slot.',
-          },
+          body: { content },
         });
       } catch (err) {
         console.error('Error running manual check-in:', err);
@@ -158,31 +209,33 @@ app.post('/interactions', async function (req, res) {
     if (componentId.startsWith('confirm_')) {
       const pingId = componentId.replace('confirm_', '');
       const state = loadState();
+      const guildState = state[guild_id];
       const clickingUserId = req.body.member.user.id;
 
-      if (!state.pending || state.pending.pingId !== pingId) {
+      if (!guildState?.pending || guildState.pending.pingId !== pingId) {
         return res.send({
           type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
           data: { content: 'This has expired.', flags: InteractionResponseFlags.EPHEMERAL },
         });
       }
 
-      if (!state.pending.userIds.includes(clickingUserId)) {
+      if (!guildState.pending.userIds.includes(clickingUserId)) {
         return res.send({
           type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
           data: { content: "This isn't for you.", flags: InteractionResponseFlags.EPHEMERAL },
         });
       }
 
-      if (!state.pending.confirmed.includes(clickingUserId)) {
-        state.pending.confirmed.push(clickingUserId);
+      if (!guildState.pending.confirmed.includes(clickingUserId)) {
+        guildState.pending.confirmed.push(clickingUserId);
+        state[guild_id] = guildState;
         saveState(state);
       }
 
       return res.send({
         type: InteractionResponseType.UPDATE_MESSAGE,
         data: {
-          content: renderMessageContent(state.pending),
+          content: renderMessageContent(guildState.pending),
           components: [
             {
               type: MessageComponentTypes.ACTION_ROW,
