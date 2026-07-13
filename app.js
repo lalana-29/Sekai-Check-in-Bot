@@ -9,7 +9,7 @@ import {
   ButtonStyleTypes,
 } from 'discord-interactions';
 import { VerifyDiscordRequest, DiscordRequest } from './utils.js';
-import { getAllRows } from './sheets.js';
+import { getAllRows, getColumnValues } from './sheets.js';
 import { loadState, saveState } from './state.js';
 import { getGuildConfig, setGuildConfig, loadConfig } from './config.js';
 
@@ -32,7 +32,7 @@ function getUpcomingHourTimestamp() {
 function renderMessageContent(pending) {
   const statusLines = pending.userIds.map(id => {
     const checked = pending.confirmed.includes(id);
-    return `${checked ? '✅' : '⬜'} <@${id}>`;
+    return `${checked ? '✅' : '❌'} <@${id}>`;
   });
   return `${pending.text}\n\n**Check-in status:**\n${statusLines.join('\n')}`;
 }
@@ -57,6 +57,16 @@ async function sendReminder(text, pingId, channelId) {
       ],
     },
   });
+}
+
+async function addRoleToMember(guildId, userId, roleId) {
+  return fetch(
+    `https://discord.com/api/v10/guilds/${guildId}/members/${userId}/roles/${roleId}`,
+    {
+      method: 'PUT',
+      headers: { Authorization: `Bot ${process.env.DISCORD_TOKEN}` },
+    }
+  );
 }
 
 async function runCheckInForGuild(guildId, triggeredManually = false) {
@@ -152,7 +162,7 @@ app.post('/interactions', async function (req, res) {
       setGuildConfig(guild_id, { channelId });
       return res.send({
         type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-        data: { content: `Check-in channel set to <#${channelId}>.`, flags: InteractionResponseFlags.EPHEMERAL },
+        data: { content: `Check-in channel set to <#${channelId}>.`},
       });
     }
 
@@ -161,7 +171,7 @@ app.post('/interactions', async function (req, res) {
       setGuildConfig(guild_id, { summaryChannelId });
       return res.send({
         type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-        data: { content: `Summary channel set to <#${summaryChannelId}>.`, flags: InteractionResponseFlags.EPHEMERAL },
+        data: { content: `Summary channel set to <#${summaryChannelId}>.`},
       });
     }
 
@@ -170,7 +180,7 @@ app.post('/interactions', async function (req, res) {
       setGuildConfig(guild_id, { sheetId });
       return res.send({
         type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-        data: { content: `Sheet ID updated.`, flags: InteractionResponseFlags.EPHEMERAL },
+        data: { content: `Sheet ID updated.`},
       });
     }
 
@@ -201,6 +211,82 @@ app.post('/interactions', async function (req, res) {
       }
       return;
     }
+
+    if (name === 'sync-role') {
+      res.send({
+        type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
+        data: { flags: InteractionResponseFlags.EPHEMERAL },
+      });
+
+      const roleId = options.find(o => o.name === 'role').value;
+      const column = options.find(o => o.name === 'column').value.toUpperCase();
+      const sheetTabOpt = options.find(o => o.name === 'sheet_tab');
+      const sheetTab = sheetTabOpt ? sheetTabOpt.value : 'G1';
+
+      try {
+        const cfg = getGuildConfig(guild_id);
+        if (!cfg.sheetId) {
+          await DiscordRequest(`webhooks/${process.env.APP_ID}/${req.body.token}/messages/@original`, {
+            method: 'PATCH',
+            body: { content: "This server isn't configured yet. Use /set-sheet first." },
+          });
+          return;
+        }
+
+        const userIds = await getColumnValues(sheetTab, cfg.sheetId, column);
+        const results = { added: [], notInGuild: [], failed: [] };
+
+        for (const userId of userIds) {
+          let response;
+          try {
+            response = await addRoleToMember(guild_id, userId, roleId);
+          } catch (err) {
+            results.failed.push(userId);
+            continue;
+          }
+
+          if (response.status === 204) {
+            results.added.push(userId);
+          } else if (response.status === 404) {
+            results.notInGuild.push(userId);
+          } else if (response.status === 429) {
+            const body = await response.json().catch(() => ({}));
+            await new Promise(r => setTimeout(r, (body.retry_after || 1) * 1000));
+            const retry = await addRoleToMember(guild_id, userId, roleId);
+            retry.status === 204 ? results.added.push(userId) : results.failed.push(userId);
+          } else {
+            results.failed.push(userId);
+          }
+
+          // Gentle pacing to avoid tripping the per-route rate limit.
+          await new Promise(r => setTimeout(r, 300));
+        }
+
+        const summary =
+          `**Role sync complete for <@&${roleId}>**\n` +
+          `✅ Added: ${results.added.length}\n` +
+          `⚠️ Not in server: ${results.notInGuild.length}\n` +
+          `❌ Failed: ${results.failed.length}` +
+          (results.notInGuild.length
+            ? `\nNot in server: ${results.notInGuild.map(id => `<@${id}>`).join(', ')}`
+            : '') +
+          (results.failed.length
+            ? `\nFailed: ${results.failed.map(id => `<@${id}>`).join(', ')}`
+            : '');
+
+        await DiscordRequest(`webhooks/${process.env.APP_ID}/${req.body.token}/messages/@original`, {
+          method: 'PATCH',
+          body: { content: summary },
+        });
+      } catch (err) {
+        console.error('Error running sync-role:', err);
+        await DiscordRequest(`webhooks/${process.env.APP_ID}/${req.body.token}/messages/@original`, {
+          method: 'PATCH',
+          body: { content: 'Something went wrong syncing the role.' },
+        });
+      }
+      return;
+    }
   }
 
   if (type === InteractionType.MESSAGE_COMPONENT) {
@@ -222,7 +308,7 @@ app.post('/interactions', async function (req, res) {
       if (!guildState.pending.userIds.includes(clickingUserId)) {
         return res.send({
           type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: { content: "This isn't for you.", flags: InteractionResponseFlags.EPHEMERAL },
+          data: { content: "You aren't on the check-in, silly!", flags: InteractionResponseFlags.EPHEMERAL },
         });
       }
 

@@ -29,3 +29,23 @@ export async function getAllRows(sheetName, spreadsheetId) {
   }
   return rows;
 }
+
+// Reads a single column (skipping the header row) and extracts Discord
+// snowflake IDs from each cell. Accepts either raw IDs or <@id> mentions.
+export async function getColumnValues(sheetName, spreadsheetId, column) {
+  const range = `${sheetName}!${column}2:${column}`;
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range,
+  });
+
+  const rows = res.data.values || [];
+  return rows
+    .map(r => r[0])
+    .filter(Boolean)
+    .map(cell => {
+      const match = String(cell).match(/\d{15,20}/);
+      return match ? match[0] : null;
+    })
+    .filter(Boolean);
+}
