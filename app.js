@@ -17,6 +17,14 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 app.use(express.json({ verify: VerifyDiscordRequest(process.env.PUBLIC_KEY) }));
 
+// A "room" is a check-in cluster: a sheet tab + the channel it posts to.
+// G1 uses the original `channelId` field for backward compatibility with
+// existing configs; G2 is the new addition.
+const ROOMS = [
+  { key: 'G1', tab: 'G1', channelField: 'channelId' },
+  { key: 'G2', tab: 'G2', channelField: 'g2ChannelId' },
+];
+
 function extractUserIds(text) {
   const matches = [...text.matchAll(/<@!?(\d+)>/g)];
   return [...new Set(matches.map(m => m[1]))];
@@ -37,7 +45,7 @@ function renderMessageContent(pending) {
   return `${pending.text}\n\n**Check-in status:**\n${statusLines.join('\n')}`;
 }
 
-async function sendReminder(text, pingId, channelId) {
+async function sendReminder(text, pingId, roomKey, channelId) {
   await DiscordRequest(`channels/${channelId}/messages`, {
     method: 'POST',
     body: {
@@ -48,7 +56,7 @@ async function sendReminder(text, pingId, channelId) {
           components: [
             {
               type: MessageComponentTypes.BUTTON,
-              custom_id: `confirm_${pingId}`,
+              custom_id: `confirm_${roomKey}_${pingId}`,
               label: 'Confirm',
               style: ButtonStyleTypes.PRIMARY,
             },
@@ -69,20 +77,27 @@ async function addRoleToMember(guildId, userId, roleId) {
   );
 }
 
-async function runCheckInForGuild(guildId, triggeredManually = false) {
+async function runCheckInForGuild(guildId, roomKey, triggeredManually = false) {
+  const room = ROOMS.find(r => r.key === roomKey);
+  if (!room) {
+    console.log(`[checkin] Unknown room ${roomKey} for guild ${guildId}, skipping.`);
+    return { sent: false, reason: 'unknown_room' };
+  }
+
   const cfg = getGuildConfig(guildId);
-  if (!cfg.channelId || !cfg.sheetId) {
-    console.log(`[checkin] Guild ${guildId} missing config, skipping.`);
+  const channelId = cfg[room.channelField];
+  if (!channelId || !cfg.sheetId) {
+    console.log(`[checkin] Guild ${guildId} room ${roomKey} missing config, skipping.`);
     return { sent: false, reason: 'not_configured' };
   }
 
-  console.log(`[checkin] Running${triggeredManually ? ' (manual trigger)' : ''} for guild ${guildId} at`, new Date().toISOString());
-  const rows = await getAllRows('G1', cfg.sheetId);
+  console.log(`[checkin] Running${triggeredManually ? ' (manual trigger)' : ''} for guild ${guildId} room ${roomKey} at`, new Date().toISOString());
+  const rows = await getAllRows(room.tab, cfg.sheetId);
   const targetTs = getUpcomingHourTimestamp();
   const row = rows.find(r => parseInt(r.timestamp, 10) === targetTs);
 
   if (!row || !row.text) {
-    console.log('[checkin] No matching row found, skipping.');
+    console.log(`[checkin] No matching row found for room ${roomKey}, skipping.`);
     return { sent: false, reason: 'no_row' };
   }
 
@@ -91,58 +106,63 @@ async function runCheckInForGuild(guildId, triggeredManually = false) {
   const pingId = Date.now().toString();
 
   const pending = { pingId, timestamp: targetTs, text, userIds, confirmed: [] };
-  await sendReminder(renderMessageContent(pending), pingId, cfg.channelId);
+  await sendReminder(renderMessageContent(pending), pingId, roomKey, channelId);
 
   const state = loadState();
-  state[guildId] = { pending };
+  state[guildId] = state[guildId] || {};
+  state[guildId][roomKey] = { pending };
   saveState(state);
 
-  console.log('[checkin] Sent message for row:', row.timestamp);
+  console.log(`[checkin] Sent message for room ${roomKey}, row:`, row.timestamp);
   return { sent: true };
 }
 
-// :45 — run for every configured guild
+// :45 — run for every configured guild, once per configured room
 cron.schedule('45 * * * *', async () => {
   const config = loadConfig();
   for (const guildId of Object.keys(config)) {
-    try {
-      await runCheckInForGuild(guildId);
-    } catch (err) {
-      console.error(`Error sending :45 message for guild ${guildId}:`, err);
+    for (const room of ROOMS) {
+      if (!config[guildId][room.channelField]) continue; // room not set up for this guild
+      try {
+        await runCheckInForGuild(guildId, room.key);
+      } catch (err) {
+        console.error(`Error sending :45 message for guild ${guildId} room ${room.key}:`, err);
+      }
     }
   }
 });
 
-// :55 — per guild, post summary if needed, always clear pending after
+// :55 — per guild, per room, post summary if needed, always clear that room's pending after
 cron.schedule('55 * * * *', async () => {
   const config = loadConfig();
   for (const guildId of Object.keys(config)) {
-    try {
-      const cfg = config[guildId];
-      if (!cfg.summaryChannelId) continue;
+    const cfg = config[guildId];
+    if (!cfg.summaryChannelId) continue;
 
-      const state = loadState();
-      const guildState = state[guildId];
-      const pending = guildState?.pending;
-      if (!pending) continue;
+    for (const room of ROOMS) {
+      try {
+        const state = loadState();
+        const pending = state[guildId]?.[room.key]?.pending;
+        if (!pending) continue;
 
-      const missing = pending.userIds.filter(id => !pending.confirmed.includes(id));
+        const missing = pending.userIds.filter(id => !pending.confirmed.includes(id));
 
-      if (missing.length > 0) {
-        const mentions = missing.map(id => `<@${id}>`).join(' ');
-        const summaryText = `${missing.length} user(s) did not check in: ${mentions}\nConsider sending an emergency ping.`;
-        await DiscordRequest(`channels/${cfg.summaryChannelId}/messages`, {
-          method: 'POST',
-          body: { content: summaryText },
-        });
+        if (missing.length > 0) {
+          const mentions = missing.map(id => `<@${id}>`).join(' ');
+          const summaryText = `[${room.key}] ${missing.length} user(s) did not check in: ${mentions}\nConsider sending an emergency ping.`;
+          await DiscordRequest(`channels/${cfg.summaryChannelId}/messages`, {
+            method: 'POST',
+            body: { content: summaryText },
+          });
+        }
+
+        // Always clear this room's pending after :55 runs, regardless of outcome —
+        // prevents stale pending from leaking into the next hour if :45 finds no row.
+        state[guildId][room.key] = { pending: null };
+        saveState(state);
+      } catch (err) {
+        console.error(`Error posting :55 summary for guild ${guildId} room ${room.key}:`, err);
       }
-
-      // Always clear pending after :55 runs, regardless of outcome —
-      // prevents stale pending from leaking into the next hour if :45 finds no row.
-      state[guildId] = { pending: null };
-      saveState(state);
-    } catch (err) {
-      console.error(`Error posting :55 summary for guild ${guildId}:`, err);
     }
   }
 });
@@ -162,7 +182,16 @@ app.post('/interactions', async function (req, res) {
       setGuildConfig(guild_id, { channelId });
       return res.send({
         type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-        data: { content: `Check-in channel set to <#${channelId}>.`},
+        data: { content: `G1 check-in channel set to <#${channelId}>.`},
+      });
+    }
+
+    if (name === 'set-g2-checkin-channel') {
+      const g2ChannelId = options[0].value;
+      setGuildConfig(guild_id, { g2ChannelId });
+      return res.send({
+        type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+        data: { content: `G2 check-in channel set to <#${g2ChannelId}>.`},
       });
     }
 
@@ -190,12 +219,15 @@ app.post('/interactions', async function (req, res) {
         data: { flags: InteractionResponseFlags.EPHEMERAL },
       });
 
+      const roomOpt = options?.find(o => o.name === 'room');
+      const roomKey = roomOpt ? roomOpt.value : 'G1';
+
       try {
-        const result = await runCheckInForGuild(guild_id, true);
-        let content = 'Check-in triggered.';
+        const result = await runCheckInForGuild(guild_id, roomKey, true);
+        let content = `Check-in triggered for ${roomKey}.`;
         if (!result.sent) {
           content = result.reason === 'not_configured'
-            ? 'This server isn\'t configured yet. Use /set-checkin-channel and /set-sheet first.'
+            ? `Room ${roomKey} isn't configured yet. Use ${roomKey === 'G2' ? '/set-g2-checkin-channel' : '/set-checkin-channel'} and /set-sheet first.`
             : 'No matching row found for the current time slot.';
         }
         await DiscordRequest(`webhooks/${process.env.APP_ID}/${req.body.token}/messages/@original`, {
@@ -221,7 +253,7 @@ app.post('/interactions', async function (req, res) {
       const roleId = options.find(o => o.name === 'role').value;
       const column = options.find(o => o.name === 'column').value.toUpperCase();
       const sheetTabOpt = options.find(o => o.name === 'sheet_tab');
-      const sheetTab = sheetTabOpt ? sheetTabOpt.value : 'G1';
+      const sheetTab = sheetTabOpt ? sheetTabOpt.value : 'Players';
 
       try {
         const cfg = getGuildConfig(guild_id);
@@ -292,10 +324,12 @@ app.post('/interactions', async function (req, res) {
   if (type === InteractionType.MESSAGE_COMPONENT) {
     const componentId = data.custom_id;
 
-    if (componentId.startsWith('confirm_')) {
-      const pingId = componentId.replace('confirm_', '');
+    const confirmMatch = componentId.match(/^confirm_(G1|G2)_(\d+)$/);
+
+    if (confirmMatch) {
+      const [, roomKey, pingId] = confirmMatch;
       const state = loadState();
-      const guildState = state[guild_id];
+      const guildState = state[guild_id]?.[roomKey];
       const clickingUserId = req.body.member.user.id;
 
       if (!guildState?.pending || guildState.pending.pingId !== pingId) {
@@ -314,7 +348,7 @@ app.post('/interactions', async function (req, res) {
 
       if (!guildState.pending.confirmed.includes(clickingUserId)) {
         guildState.pending.confirmed.push(clickingUserId);
-        state[guild_id] = guildState;
+        state[guild_id][roomKey] = guildState;
         saveState(state);
       }
 
@@ -328,7 +362,7 @@ app.post('/interactions', async function (req, res) {
               components: [
                 {
                   type: MessageComponentTypes.BUTTON,
-                  custom_id: `confirm_${pingId}`,
+                  custom_id: `confirm_${roomKey}_${pingId}`,
                   label: 'Confirm',
                   style: ButtonStyleTypes.PRIMARY,
                 },

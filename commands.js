@@ -9,18 +9,45 @@ const TRIGGER_CHECKIN_COMMAND = {
   description: 'Manually send the current check-in message',
   type: 1,
   default_member_permissions: MANAGE_GUILD,
+  options: [
+    {
+      type: 3, // STRING
+      name: 'room',
+      description: 'Which room to trigger (defaults to G1)',
+      required: false,
+      choices: [
+        { name: 'G1', value: 'G1' },
+        { name: 'G2', value: 'G2' },
+      ],
+    },
+  ],
 };
 
 const SET_CHECKIN_CHANNEL_COMMAND = {
   name: 'set-checkin-channel',
-  description: 'Set the channel where check-in messages are sent',
+  description: 'Set the channel where G1 check-in messages are sent',
   type: 1,
   default_member_permissions: MANAGE_GUILD,
   options: [
     {
       type: 7, // CHANNEL
       name: 'channel',
-      description: 'The channel for check-in messages',
+      description: 'The channel for G1 check-in messages',
+      required: true,
+    },
+  ],
+};
+
+const SET_G2_CHECKIN_CHANNEL_COMMAND = {
+  name: 'set-g2-checkin-channel',
+  description: 'Set the channel where G2 check-in messages are sent',
+  type: 1,
+  default_member_permissions: MANAGE_GUILD,
+  options: [
+    {
+      type: 7, // CHANNEL
+      name: 'channel',
+      description: 'The channel for G2 check-in messages',
       required: true,
     },
   ],
@@ -77,7 +104,7 @@ const SYNC_ROLE_COMMAND = {
     {
       type: 3, // STRING
       name: 'sheet_tab',
-      description: 'Sheet tab name (defaults to G1)',
+      description: 'Sheet tab name (defaults to Players)',
       required: false,
     },
   ],
@@ -86,6 +113,7 @@ const SYNC_ROLE_COMMAND = {
 const ALL_COMMANDS = [
   TRIGGER_CHECKIN_COMMAND,
   SET_CHECKIN_CHANNEL_COMMAND,
+  SET_G2_CHECKIN_CHANNEL_COMMAND,
   SET_SUMMARY_CHANNEL_COMMAND,
   SET_SHEET_COMMAND,
   SYNC_ROLE_COMMAND,
